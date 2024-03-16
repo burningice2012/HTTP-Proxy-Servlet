@@ -16,6 +16,9 @@
 
 package org.mitre.dsmiley.httpproxy;
 
+import com.google.gson.JsonElement;
+import jakarta.servlet.http.*;
+import org.apache.commons.codec.digest.Md5Crypt;
 import org.apache.http.Header;
 import org.apache.http.HttpEntity;
 import org.apache.http.HttpEntityEnclosingRequest;
@@ -29,8 +32,10 @@ import org.apache.http.client.config.RequestConfig;
 import org.apache.http.client.methods.AbortableHttpRequest;
 import org.apache.http.client.utils.URIUtils;
 import org.apache.http.config.SocketConfig;
+import org.apache.http.conn.EofSensorInputStream;
 import org.apache.http.entity.InputStreamEntity;
 import org.apache.http.impl.client.HttpClientBuilder;
+import org.apache.http.impl.io.ChunkedInputStream;
 import org.apache.http.message.BasicHeader;
 import org.apache.http.message.BasicHttpEntityEnclosingRequest;
 import org.apache.http.message.BasicHttpRequest;
@@ -38,19 +43,14 @@ import org.apache.http.message.HeaderGroup;
 import org.apache.http.util.EntityUtils;
 
 import jakarta.servlet.ServletException;
-import jakarta.servlet.http.Cookie;
-import jakarta.servlet.http.HttpServlet;
-import jakarta.servlet.http.HttpServletRequest;
-import jakarta.servlet.http.HttpServletResponse;
-import java.io.Closeable;
-import java.io.IOException;
-import java.io.InputStream;
-import java.io.OutputStream;
+
+import java.io.*;
 import java.net.HttpCookie;
 import java.net.URI;
-import java.util.BitSet;
-import java.util.Enumeration;
-import java.util.Formatter;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Paths;
+import java.util.*;
 
 /**
  * An HTTP reverse proxy/gateway servlet. It is designed to be extended for customization
@@ -111,6 +111,13 @@ public class ProxyServlet extends HttpServlet {
   /** The parameter name for the target (destination) URI to proxy to. */
   public static final String P_TARGET_URI = "targetUri";
 
+  public static final String P_CACHETOLOCAL = "cacheToLocal";
+  public static final String P_CACHEAJAXTOLOCAL = "cacheAjaxToLocal";
+  public static final String P_CACHESTATICTOLOCAL = "cacheStaticToLocal";
+
+  public static final String P_READCACHEFORAJAX = "readCacheForAjax";
+  public static final String P_READCACHEFORSTATIC = "readCacheForStatic";
+
   protected static final String ATTR_TARGET_URI =
           ProxyServlet.class.getSimpleName() + ".targetUri";
   protected static final String ATTR_TARGET_HOST =
@@ -133,6 +140,13 @@ public class ProxyServlet extends HttpServlet {
   protected int connectionRequestTimeout = -1;
   protected int maxConnections = -1;
 
+  protected boolean doCacheToLocal = true;
+  protected boolean doCacheAjaxToLocal = true;
+  protected boolean doCacheStaticToLocal = true;
+  protected boolean doReadCacheForAjax = false;
+  protected boolean doReadCacheForStatic = true;
+
+
   //These next 3 are cached here, and should only be referred to in initialization logic. See the
   // ATTR_* parameters.
   /** From the configured parameter "targetUri". */
@@ -141,6 +155,7 @@ public class ProxyServlet extends HttpServlet {
   protected HttpHost targetHost;//URIUtils.extractHost(targetUriObj);
 
   private HttpClient proxyClient;
+  private String localCachePath;
 
   @Override
   public String getServletInfo() {
@@ -162,6 +177,11 @@ public class ProxyServlet extends HttpServlet {
    */
   protected String getConfigParam(String key) {
     return getServletConfig().getInitParameter(key);
+  }
+
+  protected boolean getBooleanConfigParam(String key, boolean defaultValue) {
+    String value = getConfigParam(key);
+    return value == null || value.length() == 0 ? defaultValue : Boolean.parseBoolean(value);
   }
 
   @Override
@@ -226,9 +246,18 @@ public class ProxyServlet extends HttpServlet {
       this.doHandleCompression = Boolean.parseBoolean(doHandleCompression);
     }
 
+    this.doCacheToLocal = this.getBooleanConfigParam(P_CACHETOLOCAL, true);
+    this.doCacheAjaxToLocal = this.getBooleanConfigParam(P_CACHEAJAXTOLOCAL, true);
+    this.doCacheStaticToLocal = this.getBooleanConfigParam(P_CACHESTATICTOLOCAL, true);
+    this.doReadCacheForAjax = this.getBooleanConfigParam(P_READCACHEFORAJAX, false);
+    this.doReadCacheForStatic = this.getBooleanConfigParam(P_READCACHEFORSTATIC, true);
+
     initTarget();//sets target*
 
     proxyClient = createHttpClient();
+
+    String webRootPath = this.getServletContext().getRealPath("/");
+    this.localCachePath = webRootPath + "/.local-cache";
   }
 
   /**
@@ -339,15 +368,147 @@ public class ProxyServlet extends HttpServlet {
     super.destroy();
   }
 
+  // resolve file extension from content type
+  private static final Map<String, String> EXTENSION_MAPPING = new HashMap<>();
+
+  static {
+    EXTENSION_MAPPING.put("application/javascript", "js");
+    EXTENSION_MAPPING.put("application/json", "json");
+    EXTENSION_MAPPING.put("application/xml", "xml");
+    EXTENSION_MAPPING.put("text/css", "css");
+    EXTENSION_MAPPING.put("text/html", "html");
+    EXTENSION_MAPPING.put("text/plain", "txt");
+    EXTENSION_MAPPING.put("text/xml", "xml");
+    EXTENSION_MAPPING.put("image/gif", "gif");
+    EXTENSION_MAPPING.put("image/jpeg", "jpg");
+    EXTENSION_MAPPING.put("image/png", "png");
+    EXTENSION_MAPPING.put("image/svg+xml", "svg");
+    EXTENSION_MAPPING.put("image/tiff", "tiff");
+    EXTENSION_MAPPING.put("image/webp", "webp");
+    EXTENSION_MAPPING.put("image/x-icon", "ico");
+    EXTENSION_MAPPING.put("image/x-jng", "jng");
+    EXTENSION_MAPPING.put("image/x-ms-bmp", "bmp");
+  }
+  private String getExtension(String contentType) {
+    if (contentType == null) return null;
+    if (contentType.contains(";"))
+      contentType = contentType.substring(0, contentType.indexOf(";"));
+    return EXTENSION_MAPPING.get(contentType.toLowerCase());
+  }
+
+  private String deriveContentType(HttpServletRequest servletRequest, HttpServletResponse servletResponse) {
+    String contentType = servletRequest.getContentType();
+    if (contentType == null) {
+      contentType = servletResponse.getContentType();
+      if (contentType == null) {
+        String accept = servletRequest.getHeader("Accept");
+        if (accept != null) {
+          int commaIndex = accept.indexOf(',');
+          if (commaIndex != -1)
+            accept = accept.substring(0, commaIndex);
+          contentType = accept;
+        }
+      }
+    }
+
+    return contentType;
+  }
+
+  private String buildCacheFileName(String contentType, HttpServletRequest servletRequest) {
+    String cacheFileName = servletRequest.getRequestURI();
+    if ("".equals(cacheFileName) || "/".equals(cacheFileName)) {
+      cacheFileName = "/_root_";
+    }
+
+    String queryStr = servletRequest.getQueryString();
+    if ("POST".equals(servletRequest.getMethod())) {
+      StringBuilder queryStrBuilder = (queryStr == null ? new StringBuilder() : new StringBuilder(queryStr));
+      Map<String, String[]> parameterMap = servletRequest.getParameterMap();
+      for (Map.Entry<String, String[]> paramEntry : parameterMap.entrySet()) {
+        String paramName = paramEntry.getKey();
+        if ("startTime".equals(paramName) || "endTime".equals(paramName)) {
+          // ignore startTime and endTime parameters
+          continue;
+        }
+
+        String[] paramValue = paramEntry.getValue();
+        if (queryStrBuilder.length() > 0) {
+          queryStrBuilder.append('&');
+        }
+        queryStrBuilder.append(paramName).append('=').append(paramValue != null && paramValue.length > 0 ? paramValue[0] : "");
+      }
+    }
+    if (queryStr != null && queryStr.length() > 0) {
+      cacheFileName += (queryStr.length() > 31 ? queryStr.substring(0, 31) : queryStr).replace('&', ',') + "_" +
+              Md5Crypt.md5Crypt(queryStr.getBytes(StandardCharsets.UTF_8), "md5", "")
+                      .replace('/', '_')
+                      .replace('$', '_');
+    }
+
+    String cacheFileSuffix = getExtension(contentType);
+    if (cacheFileSuffix == null) {
+      cacheFileSuffix = ".unknown";
+    } else {
+      cacheFileSuffix = "." + cacheFileSuffix;
+    }
+
+    if (!cacheFileName.endsWith(cacheFileSuffix)) {
+      cacheFileName += cacheFileSuffix;
+    }
+
+    return cacheFileName;
+  }
+
   @Override
   protected void service(HttpServletRequest servletRequest, HttpServletResponse servletResponse)
       throws ServletException, IOException {
     //initialize request attributes from caches if unset by a subclass by this point
+
     if (servletRequest.getAttribute(ATTR_TARGET_URI) == null) {
       servletRequest.setAttribute(ATTR_TARGET_URI, targetUri);
     }
     if (servletRequest.getAttribute(ATTR_TARGET_HOST) == null) {
       servletRequest.setAttribute(ATTR_TARGET_HOST, targetHost);
+    }
+
+    log("service for " + servletRequest.getRequestURI() + ", referer: " + servletRequest.getHeader("referer") + "，authorization: " + authorization + ", needAuthorization: " + needAuthorization);
+
+    String contentType = deriveContentType(servletRequest, servletResponse);
+
+    boolean isAjax = contentType != null && contentType.startsWith("application/json");
+    String cacheFileName = buildCacheFileName(contentType, servletRequest);
+
+    if ((isAjax && doReadCacheForAjax) || (!isAjax && doReadCacheForStatic)) {
+      // read from local cache
+      File cacheFile = new File(this.localCachePath + cacheFileName);
+      if (cacheFile.exists()) {
+        log("read from cache: " + cacheFile.getAbsolutePath() + " for " + servletRequest.getRequestURI());
+        InputStreamEntity cachedIntity = new InputStreamEntity(new FileInputStream(cacheFile), -1);
+        servletResponse.setStatus(HttpServletResponse.SC_OK);
+        List<String> headers = Files.readAllLines(Paths.get(cacheFile.getAbsolutePath() + ".header"));
+        for (String header : headers) {
+          int index = header.indexOf(": ");
+          if (index > 0) {
+            String headerName = header.substring(0, index);
+            String headerValue = header.substring(index + 2);
+            servletResponse.addHeader(headerName, headerValue);
+          }
+        }
+        cachedIntity.writeTo(servletResponse.getOutputStream());
+        return;
+      }
+    }
+
+
+    HttpSession session = servletRequest.getSession();
+    String authorization = servletRequest.getHeader("Authorization");
+    if (authorization != null && authorization.length() > 0) {
+      authorization = (String)session.getAttribute("Authorization");
+    }
+
+    if (authorization != null && authorization.length() > 0) {
+      // need authorization
+
     }
 
     // Make the Request
@@ -368,6 +529,7 @@ public class ProxyServlet extends HttpServlet {
     setXForwardedForHeader(servletRequest, proxyRequest);
 
     HttpResponse proxyResponse = null;
+    OutputStream localCache = null;
     try {
       // Execute the request
       proxyResponse = doExecute(servletRequest, servletResponse, proxyRequest);
@@ -388,10 +550,34 @@ public class ProxyServlet extends HttpServlet {
         // Don't send body entity/content!
         servletResponse.setIntHeader(HttpHeaders.CONTENT_LENGTH, 0);
       } else {
-        // Send the content to the client
-        copyResponseEntity(proxyResponse, servletResponse, proxyRequest, servletRequest);
-      }
+        if (this.doCacheToLocal && statusCode == HttpServletResponse.SC_OK) {
+          if ((isAjax && doCacheAjaxToLocal) || (!isAjax && doCacheStaticToLocal)) {
+            File cacheFile = new File(this.localCachePath + cacheFileName);
+            File cacheDir = cacheFile.getParentFile();
+            if (!cacheDir.exists()) {
+              cacheDir.mkdirs();
+            }
 
+            localCache = (!isAjax ? new FileOutputStream(cacheFile) : new JsonFileOutputStream(cacheFile, json -> !json.has("code") || json.get("code").getAsInt() == 200));
+
+            File cacheHeader = new File(this.localCachePath + cacheFileName + ".header");
+            StringBuilder sbHeaders = new StringBuilder();
+            for (Header header : proxyResponse.getAllHeaders()) {
+              String headerName = header.getName();
+              if (hopByHopHeaders.containsHeader(headerName))
+                continue;
+              sbHeaders.append(headerName).append(": ").append(header.getValue()).append("\r\n");
+            }
+            try (FileOutputStream fosHeader = new FileOutputStream(cacheHeader)) {
+              fosHeader.write(sbHeaders.toString().getBytes());
+            }
+          }
+        }
+
+        // Send the content to the client
+        log("copyResponse for " + servletRequest.getRequestURI() + ", cacheFile: " + (localCache == null ? "" : cacheFileName) + ", chunked: " + proxyResponse.getEntity().isChunked());
+        copyResponseEntity(proxyResponse, servletResponse, proxyRequest, servletRequest, localCache);
+      }
     } catch (Exception e) {
       handleRequestException(proxyRequest, proxyResponse, e);
     } finally {
@@ -400,7 +586,105 @@ public class ProxyServlet extends HttpServlet {
         EntityUtils.consumeQuietly(proxyResponse.getEntity());
       //Note: Don't need to close servlet outputStream:
       // http://stackoverflow.com/questions/1159168/should-one-call-close-on-httpservletresponse-getoutputstream-getwriter
+
+      if (localCache != null) {
+        try {
+          localCache.close();
+        } catch (IOException e) {
+          e.printStackTrace();
+        }
+      }
     }
+  }
+
+  private String fetchAuthorizationToken(HttpServletRequest servletRequest) throws IOException {
+    String token = null;
+    // Make the Request
+    //note: we won't transfer the protocol version because I'm not sure it would truly be compatible
+    String method = servletRequest.getMethod();
+    String proxyRequestUri = rewriteUrlFromRequest(servletRequest);
+    HttpRequest proxyRequest;
+    //spec: RFC 2616, sec 4.3: either of these two headers signal that there is a message body.
+    if (servletRequest.getHeader(HttpHeaders.CONTENT_LENGTH) != null ||
+            servletRequest.getHeader(HttpHeaders.TRANSFER_ENCODING) != null) {
+      proxyRequest = newProxyRequestWithEntity(method, proxyRequestUri, servletRequest);
+    } else {
+      proxyRequest = new BasicHttpRequest(method, proxyRequestUri);
+    }
+
+    copyRequestHeaders(servletRequest, proxyRequest);
+
+    setXForwardedForHeader(servletRequest, proxyRequest);
+
+    HttpResponse proxyResponse = null;
+    OutputStream localCache = null;
+    try {
+      // Execute the request
+      proxyResponse = doExecute(servletRequest, servletResponse, proxyRequest);
+
+      // Process the response:
+
+      int statusCode = proxyResponse.getStatusLine().getStatusCode();
+      servletResponse.setStatus(statusCode);
+
+      // Copying response headers to make sure SESSIONID or other Cookie which comes from the remote
+      // server will be saved in client when the proxied url was redirected to another one.
+      // See issue [#51](https://github.com/mitre/HTTP-Proxy-Servlet/issues/51)
+      copyResponseHeaders(proxyResponse, servletRequest, servletResponse);
+
+      if (statusCode == HttpServletResponse.SC_NOT_MODIFIED) {
+        // 304 needs special handling.  See:
+        // http://www.ics.uci.edu/pub/ietf/http/rfc1945.html#Code304
+        // Don't send body entity/content!
+        servletResponse.setIntHeader(HttpHeaders.CONTENT_LENGTH, 0);
+      } else {
+        if (this.doCacheToLocal && statusCode == HttpServletResponse.SC_OK) {
+          if ((isAjax && doCacheAjaxToLocal) || (!isAjax && doCacheStaticToLocal)) {
+            File cacheFile = new File(this.localCachePath + cacheFileName);
+            File cacheDir = cacheFile.getParentFile();
+            if (!cacheDir.exists()) {
+              cacheDir.mkdirs();
+            }
+
+            localCache = (!isAjax ? new FileOutputStream(cacheFile) : new JsonFileOutputStream(cacheFile, json -> !json.has("code") || json.get("code").getAsInt() == 200));
+
+            File cacheHeader = new File(this.localCachePath + cacheFileName + ".header");
+            StringBuilder sbHeaders = new StringBuilder();
+            for (Header header : proxyResponse.getAllHeaders()) {
+              String headerName = header.getName();
+              if (hopByHopHeaders.containsHeader(headerName))
+                continue;
+              sbHeaders.append(headerName).append(": ").append(header.getValue()).append("\r\n");
+            }
+            try (FileOutputStream fosHeader = new FileOutputStream(cacheHeader)) {
+              fosHeader.write(sbHeaders.toString().getBytes());
+            }
+          }
+        }
+
+        // Send the content to the client
+        log("copyResponse for " + servletRequest.getRequestURI() + ", cacheFile: " + (localCache == null ? "" : cacheFileName) + ", chunked: " + proxyResponse.getEntity().isChunked());
+        copyResponseEntity(proxyResponse, servletResponse, proxyRequest, servletRequest, localCache);
+      }
+    } catch (Exception e) {
+      handleRequestException(proxyRequest, proxyResponse, e);
+    } finally {
+      // make sure the entire entity was consumed, so the connection is released
+      if (proxyResponse != null)
+        EntityUtils.consumeQuietly(proxyResponse.getEntity());
+      //Note: Don't need to close servlet outputStream:
+      // http://stackoverflow.com/questions/1159168/should-one-call-close-on-httpservletresponse-getoutputstream-getwriter
+
+      if (localCache != null) {
+        try {
+          localCache.close();
+        } catch (IOException e) {
+          e.printStackTrace();
+        }
+      }
+    }
+
+
   }
 
   protected void handleRequestException(HttpRequest proxyRequest, HttpResponse proxyResponse, Exception e) throws ServletException, IOException {
@@ -666,7 +950,7 @@ public class ProxyServlet extends HttpServlet {
 
   /** Copy response body data (the entity) from the proxy to the servlet client. */
   protected void copyResponseEntity(HttpResponse proxyResponse, HttpServletResponse servletResponse,
-                                    HttpRequest proxyRequest, HttpServletRequest servletRequest)
+                                    HttpRequest proxyRequest, HttpServletRequest servletRequest, OutputStream localCache)
           throws IOException {
     HttpEntity entity = proxyResponse.getEntity();
     if (entity != null) {
@@ -678,6 +962,7 @@ public class ProxyServlet extends HttpServlet {
         int read;
         while ((read = is.read(buffer)) != -1) {
           os.write(buffer, 0, read);
+          localCache.write(buffer, 0, read);
           /*-
            * Issue in Apache http client/JDK: if the stream from client is
            * compressed, apache http client will delegate to GzipInputStream.
@@ -693,13 +978,56 @@ public class ProxyServlet extends HttpServlet {
            */
           if (doHandleCompression || is.available() == 0 /* next is.read will block */) {
             os.flush();
+            localCache.flush();
           }
         }
         // Entity closing/cleanup is done in the caller (#service)
       } else {
         OutputStream servletOutputStream = servletResponse.getOutputStream();
-        entity.writeTo(servletOutputStream);
+        OutputStream os = (localCache == null ? servletOutputStream : new DualOutputStreamDelegate(servletOutputStream, localCache));
+        //entity.writeTo(servletOutputStream);
+        entity.writeTo(os);
       }
+    }
+  }
+
+  private static class DualOutputStreamDelegate extends OutputStream {
+    private OutputStream os1;
+    private OutputStream os2;
+
+    public DualOutputStreamDelegate(OutputStream os1, OutputStream os2) {
+      this.os1 = os1;
+      this.os2 = os2;
+    }
+
+    @Override
+    public void write(int b) throws IOException {
+      this.os1.write(b);
+      this.os2.write(b);
+    }
+
+    @Override
+    public void write(byte[] b) throws IOException {
+      this.os1.write(b);
+      this.os2.write(b);
+    }
+
+    @Override
+    public void write(byte[] b, int off, int len) throws IOException {
+      this.os1.write(b, off, len);
+      this.os2.write(b, off, len);
+    }
+
+    @Override
+    public void flush() throws IOException {
+      this.os1.flush();
+      this.os2.flush();
+    }
+
+    @Override
+    public void close() throws IOException {
+      this.os1.close();
+      this.os2.close();
     }
   }
 
